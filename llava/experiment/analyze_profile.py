@@ -5,19 +5,14 @@ import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 PROFILE_FIELDS = [
-    "image_preprocessing_time_ms",
-    "vit_encoding_time_ms",
-    "projector_time_ms",
-    "selector_router_time_ms",
     "llm_prefill_time_ms",
     "first_token_latency_ttft_ms",
     "decode_time_ms",
     "total_latency_ms",
-    "peak_gpu_memory_mib",
     "peak_gpu_memory_incremental_mib",
     "kv_cache_memory_mib",
     "visual_token_count",
@@ -41,27 +36,53 @@ SELECTOR_FIELDS = [
 ]
 
 DERIVED_FIELDS = [
-    "decode_ms_per_token",
-    "prefill_tflops",
-    "total_tflops",
+    "decode_throughput_tokens_per_s",
+    "llm_prefill_tflops",
+    "total_estimated_tflops",
 ]
 
-SUMMARY_METRICS = PROFILE_FIELDS + [f"flops.{name}" for name in FLOP_FIELDS] + SELECTOR_FIELDS + DERIVED_FIELDS
+KEY_SUMMARY_METRICS = [
+    "visual_token_count",
+    "prompt_token_count",
+    "prefill_token_count",
+    "generated_token_count",
+    "llm_prefill_time_ms",
+    "first_token_latency_ttft_ms",
+    "decode_time_ms",
+    "decode_throughput_tokens_per_s",
+    "total_latency_ms",
+    "peak_gpu_memory_incremental_mib",
+    "kv_cache_memory_mib",
+    "flops.llm_prefill_flops",
+    "flops.llm_decode_flops",
+    "flops.total_estimated_flops",
+    "llm_prefill_tflops",
+    "total_estimated_tflops",
+    "selector.original_visual_tokens",
+    "selector.retained_visual_tokens",
+]
+
+SUMMARY_METRICS = KEY_SUMMARY_METRICS
 
 MARKDOWN_COLUMNS = [
     "method",
     "retain_tokens",
     "count",
     "visual_token_count_mean",
+    "prompt_token_count_mean",
     "prefill_token_count_mean",
+    "generated_token_count_mean",
     "llm_prefill_time_ms_mean",
     "first_token_latency_ttft_ms_mean",
-    "decode_ms_per_token_mean",
+    "decode_throughput_tokens_per_s_mean",
     "total_latency_ms_mean",
     "kv_cache_memory_mib_mean",
     "peak_gpu_memory_incremental_mib_mean",
-    "prefill_tflops_mean",
-    "total_tflops_mean",
+    "flops.llm_prefill_flops_mean",
+    "flops.llm_decode_flops_mean",
+    "flops.total_estimated_flops_mean",
+    "llm_prefill_tflops_mean",
+    "total_estimated_tflops_mean",
     "prefill_speedup",
     "ttft_speedup",
     "total_speedup",
@@ -138,14 +159,17 @@ def load_rows(paths: Sequence[str]) -> List[Dict[str, Any]]:
 
                 generated = as_number(profile.get("generated_token_count")) or 0.0
                 decode_time = as_number(profile.get("decode_time_ms"))
-                flat["decode_ms_per_token"] = (
-                    decode_time / max(generated - 1.0, 1.0) if decode_time is not None else None
+                decode_tokens = max(generated - 1.0, 0.0)
+                flat["decode_throughput_tokens_per_s"] = (
+                    decode_tokens / (decode_time / 1000.0)
+                    if decode_tokens > 0 and decode_time is not None and decode_time > 0
+                    else None
                 )
 
                 prefill_flops = flat.get("flops.llm_prefill_flops")
                 total_flops = flat.get("flops.total_estimated_flops")
-                flat["prefill_tflops"] = prefill_flops / 1e12 if prefill_flops is not None else None
-                flat["total_tflops"] = total_flops / 1e12 if total_flops is not None else None
+                flat["llm_prefill_tflops"] = prefill_flops / 1e12 if prefill_flops is not None else None
+                flat["total_estimated_tflops"] = total_flops / 1e12 if total_flops is not None else None
                 rows.append(flat)
     return rows
 
@@ -206,14 +230,7 @@ def summarize_with_pandas(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for metric in SUMMARY_METRICS:
         if metric not in df.columns:
             continue
-        stats = grouped[metric].agg(
-            **{
-                f"{metric}_mean": "mean",
-                f"{metric}_median": "median",
-                f"{metric}_std": "std",
-                f"{metric}_p90": lambda x: x.quantile(0.9),
-            }
-        ).reset_index()
+        stats = grouped[metric].agg(**{f"{metric}_mean": "mean"}).reset_index()
         summary = summary.merge(stats, on=["method", "retain_tokens"], how="left")
 
     summary = summary.where(summary.notna(), None)
@@ -244,9 +261,6 @@ def summarize_without_pandas(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             values = [as_number(row.get(metric)) for row in group_rows]
             clean = [v for v in values if v is not None]
             summary[f"{metric}_mean"] = statistics.fmean(clean) if clean else None
-            summary[f"{metric}_median"] = statistics.median(clean) if clean else None
-            summary[f"{metric}_std"] = statistics.stdev(clean) if len(clean) > 1 else None
-            summary[f"{metric}_p90"] = percentile(clean, 0.9)
         summary_rows.append(summary)
 
     add_speedups(summary_rows)
@@ -315,7 +329,7 @@ def csv_columns(rows: List[Dict[str, Any]]) -> List[str]:
     base = ["method", "retain_tokens", "count"]
     stat_cols: List[str] = []
     for metric in SUMMARY_METRICS:
-        stat_cols.extend([f"{metric}_mean", f"{metric}_median", f"{metric}_std", f"{metric}_p90"])
+        stat_cols.append(f"{metric}_mean")
     tail = ["prefill_speedup", "ttft_speedup", "total_speedup"]
     columns = base + stat_cols + tail
     extras = sorted({key for row in rows for key in row.keys()} - set(columns))
