@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, asdict
@@ -22,9 +23,10 @@ from llava.constants import (
     IMAGE_TOKEN_INDEX,
 )
 from llava.conversation import conv_templates
-from llava.eval.token_selectors import select_visual_tokens
+from llava.eval.token_selectors import select_visionzip_visual_tokens, select_visual_tokens
 from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
-from llava.model.builder import load_pretrained_model
+from llava.model.builder import load_pretrained_model, load_sparsevlm_model
+from llava.model.efficient_vlm import disable_efficient_llama, enable_efficient_llama, set_image_token_span
 from llava.utils import disable_torch_init
 
 
@@ -350,8 +352,25 @@ def load_profile_model(
     load_8bit=False,
     load_4bit=False,
     device="cuda",
+    method="llava",
+    retain_tokens=None,
+    selector_extra=None,
 ):
     model_name = resolve_profile_model_name(model_path, model_name)
+    if (method or "").lower() == "sparsevlm":
+        selector_extra = selector_extra or {}
+        os.environ["RETAIN_TOKN"] = str(int(retain_tokens or selector_extra.get("retain_tokens", 192)))
+        if "version" in selector_extra:
+            os.environ["USE_VERSION"] = str(selector_extra["version"])
+        return load_sparsevlm_model(
+            model_path,
+            model_base,
+            model_name,
+            load_8bit=load_8bit,
+            load_4bit=load_4bit,
+            device=device,
+        )
+
     if not is_hf_llava_model_path(model_path):
         return load_pretrained_model(
             model_path,
@@ -423,6 +442,17 @@ def prepare_multimodal_embeds_with_cached_images(
         )
     finally:
         model.encode_images = original_encode_images
+
+
+def image_token_start(input_ids: torch.Tensor) -> Optional[int]:
+    image_positions = torch.where(input_ids[0] == IMAGE_TOKEN_INDEX)[0]
+    if image_positions.numel() == 0:
+        return None
+    return int(image_positions[0].item())
+
+
+def clip_layer_index(vision_tower) -> int:
+    return int(getattr(vision_tower, "select_layer", -2))
 
 
 @dataclass
@@ -628,9 +658,141 @@ def profile_hf_once(args, processor, model) -> ProfileResult:
 
 
 @torch.inference_mode()
+def profile_sparsevlm_once(args, tokenizer, model, image_processor) -> ProfileResult:
+    images = [load_image(path) for path in split_image_files(args.image_file, args.sep)]
+    image_sizes = [image.size for image in images]
+    model_device = getattr(model, "device", torch.device(args.device))
+    prompt = build_prompt(args.query, model, args.conv_mode)
+
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0)
+    input_ids = input_ids.to(model_device)
+
+    if cuda_available():
+        torch.cuda.empty_cache()
+        base_gpu_memory = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        base_gpu_memory = None
+
+    latency_start = time.perf_counter()
+
+    def preprocess():
+        image_tensor = process_images(images, image_processor, model.config)
+        return move_images_to_device(image_tensor, model_device, torch.float16)
+
+    images_tensor, image_preprocessing_time_ms = measure_wall_ms(preprocess)
+
+    def prefill():
+        sparse_outputs = model(
+            input_ids=input_ids,
+            images=images_tensor,
+            image_sizes=image_sizes,
+            use_cache=True,
+            return_dict=True,
+        )
+        return sparse_outputs[-1]
+
+    prefill_outputs, llm_prefill_time_ms = measure_gpu_ms(prefill)
+    next_token = sample_next_token(
+        prefill_outputs.logits[:, -1, :],
+        args.temperature,
+        args.top_p,
+    )
+    sync_cuda()
+    first_token_latency_ttft_ms = (time.perf_counter() - latency_start) * 1000.0
+
+    generated_ids = [next_token]
+    past_key_values = prefill_outputs.past_key_values
+    eos_token_id = tokenizer.eos_token_id
+    decode_start = time.perf_counter()
+    decode_forward_tokens = 0
+
+    for _ in range(max(args.max_new_tokens - 1, 0)):
+        if eos_token_id is not None and bool((next_token == eos_token_id).all()):
+            break
+
+        def decode_step():
+            sparse_outputs = model(
+                input_ids=next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            return sparse_outputs[-1]
+
+        step_outputs, _step_ms = measure_gpu_ms(decode_step)
+        decode_forward_tokens += 1
+        past_key_values = step_outputs.past_key_values
+        next_token = sample_next_token(
+            step_outputs.logits[:, -1, :],
+            args.temperature,
+            args.top_p,
+        )
+        generated_ids.append(next_token)
+
+    sync_cuda()
+    decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+    total_latency_ms = (time.perf_counter() - latency_start) * 1000.0
+
+    generated = torch.cat(generated_ids, dim=1)
+    output_text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+    generated_token_count = int(generated.shape[1])
+
+    if cuda_available():
+        peak_gpu_memory = torch.cuda.max_memory_allocated()
+        peak_gpu_memory_incremental = peak_gpu_memory - base_gpu_memory
+    else:
+        peak_gpu_memory = None
+        peak_gpu_memory_incremental = None
+
+    visual_token_count = int(getattr(model, "image_shape", 576))
+    prompt_token_count = int((input_ids[0] != IMAGE_TOKEN_INDEX).sum().item())
+    prefill_token_count = prompt_token_count + visual_token_count
+    retain_tokens = int(args.retain_tokens or os.environ.get("RETAIN_TOKN", 192))
+
+    return ProfileResult(
+        image_preprocessing_time_ms=image_preprocessing_time_ms,
+        vit_encoding_time_ms=None,
+        projector_time_ms=None,
+        selector_router_time_ms=None,
+        selector_info={
+            "selector_method": "sparsevlm",
+            "original_visual_tokens": visual_token_count,
+            "retained_visual_tokens": retain_tokens,
+            "selector_note": "Original SparseVLM model path; visual token sparsification is applied inside decoder layers.",
+        },
+        llm_prefill_time_ms=llm_prefill_time_ms,
+        first_token_latency_ttft_ms=first_token_latency_ttft_ms,
+        decode_time_ms=decode_time_ms,
+        total_latency_ms=total_latency_ms,
+        peak_gpu_memory_mib=bytes_to_mib(peak_gpu_memory),
+        peak_gpu_memory_incremental_mib=bytes_to_mib(peak_gpu_memory_incremental),
+        kv_cache_memory_mib=bytes_to_mib(tensor_bytes(past_key_values)),
+        flops={
+            "vit_flops": None,
+            "projector_flops": None,
+            "llm_prefill_flops": None,
+            "llm_decode_flops": None,
+            "llm_total_flops": None,
+            "generated_tokens_for_flops": generated_token_count,
+            "total_estimated_flops": None,
+        },
+        visual_token_count=visual_token_count,
+        prompt_token_count=prompt_token_count,
+        prefill_token_count=prefill_token_count,
+        generated_token_count=generated_token_count,
+        output_text=output_text,
+    )
+
+
+@torch.inference_mode()
 def profile_once(args, tokenizer, model, image_processor) -> ProfileResult:
     if is_hf_llava_model(model):
         return profile_hf_once(args, tokenizer, model)
+    if (args.method or "").lower() == "sparsevlm" and model.__class__.__name__ == "LlavaLlamaDynamicForCausalLM":
+        return profile_sparsevlm_once(args, tokenizer, model, image_processor)
+    if (args.method or "").lower() == "sparsevlm":
+        raise RuntimeError("SparseVLM requires LlavaLlamaDynamicForCausalLM; refusing to use the approximate runtime patch.")
 
     images = [load_image(path) for path in split_image_files(args.image_file, args.sep)]
     image_sizes = [image.size for image in images]
@@ -661,29 +823,64 @@ def profile_once(args, tokenizer, model, image_processor) -> ProfileResult:
 
     try:
         vision_images = concat_images_for_vision(images_tensor)
-        image_features, vit_encoding_time_ms = measure_gpu_ms(lambda: vision_tower(vision_images))
-        if projector is not None:
-            projected_features, projector_time_ms = measure_gpu_ms(lambda: projector(image_features))
-        else:
-            projected_features = image_features
+        selector_extra = json.loads(args.selector_extra) if args.selector_extra else {}
+        method = (args.method or "llava").lower()
+
+        if method == "visionzip":
+            def visionzip_clip_forward():
+                return vision_tower.vision_tower(
+                    vision_images.to(device=vision_tower.device, dtype=vision_tower.dtype),
+                    output_hidden_states=True,
+                    output_attentions=True,
+                )
+
+            clip_outputs, vit_encoding_time_ms = measure_gpu_ms(visionzip_clip_forward)
+            layer_idx = clip_layer_index(vision_tower)
+            attn_idx = layer_idx if layer_idx < 0 else max(layer_idx - 1, 0)
+            selector_output, selector_router_time_ms = measure_gpu_ms(
+                lambda: select_visionzip_visual_tokens(
+                    clip_hidden_states=clip_outputs.hidden_states[layer_idx],
+                    clip_attentions=clip_outputs.attentions[attn_idx],
+                    projector=projector,
+                    retain_tokens=args.retain_tokens,
+                    selector_extra=selector_extra,
+                )
+            )
+            projected_features, selector_info = selector_output
             projector_time_ms = None
+        else:
+            image_features, vit_encoding_time_ms = measure_gpu_ms(lambda: vision_tower(vision_images))
+            if projector is not None:
+                projected_features, projector_time_ms = measure_gpu_ms(lambda: projector(image_features))
+            else:
+                projected_features = image_features
+                projector_time_ms = None
+
+            if method == "fastv":
+                selector_router_time_ms = 0.0
+                selector_info = {
+                    "selector_method": method,
+                    "original_visual_tokens": int(projected_features.shape[-2]),
+                    "retained_visual_tokens": int(projected_features.shape[-2]),
+                    "selector_note": "Layer-wise visual token sparsification is applied inside the LLM prefill path.",
+                }
+            else:
+                selector_output, selector_router_time_ms = measure_gpu_ms(
+                    lambda: select_visual_tokens(
+                        projected_features=projected_features,
+                        method=args.method,
+                        retain_tokens=args.retain_tokens,
+                        seed=args.seed,
+                        question=args.query,
+                        input_ids=input_ids,
+                        tokenizer=tokenizer,
+                        image_grid_size=None,
+                        selector_extra=selector_extra,
+                    )
+                )
+                projected_features, selector_info = selector_output
 
         projector_output_token_count = int(projected_features.numel() // projected_features.shape[-1])
-        selector_extra = json.loads(args.selector_extra) if args.selector_extra else {}
-        selector_output, selector_router_time_ms = measure_gpu_ms(
-            lambda: select_visual_tokens(
-                projected_features=projected_features,
-                method=args.method,
-                retain_tokens=args.retain_tokens,
-                seed=args.seed,
-                question=args.query,
-                input_ids=input_ids,
-                tokenizer=tokenizer,
-                image_grid_size=None,
-                selector_extra=selector_extra,
-            )
-        )
-        projected_features, selector_info = selector_output
 
         prepared, _prepare_ms = measure_wall_ms(
             lambda: prepare_multimodal_embeds_with_cached_images(
@@ -701,6 +898,22 @@ def profile_once(args, tokenizer, model, image_processor) -> ProfileResult:
         prefill_token_count = int(inputs_embeds.shape[1])
         prompt_token_count = int((input_ids[0] != IMAGE_TOKEN_INDEX).sum().item())
         visual_token_count = max(prefill_token_count - prompt_token_count, 0)
+
+        if method == "fastv":
+            start = image_token_start(input_ids)
+            if start is None:
+                disable_efficient_llama(model)
+            else:
+                efficient_config = {**selector_extra, "retain_tokens": args.retain_tokens}
+                enable_efficient_llama(model, method, efficient_config)
+                set_image_token_span(model, start, visual_token_count)
+                if args.retain_tokens is not None:
+                    selector_info["retained_visual_tokens"] = int(args.retain_tokens)
+                elif method == "fastv":
+                    prune_ratio = float(selector_extra.get("r", selector_extra.get("fastv_r", 0.5)))
+                    selector_info["retained_visual_tokens"] = max(1, round(visual_token_count * (1.0 - prune_ratio)))
+        else:
+            disable_efficient_llama(model)
 
         def prefill():
             return model(
@@ -865,6 +1078,7 @@ def main():
     model_name = resolve_profile_model_name(args.model_path, get_model_name_from_path(args.model_path))
     if args.conv_mode is None:
         args.conv_mode = infer_conv_mode(model_name)
+    selector_extra = json.loads(args.selector_extra) if args.selector_extra else {}
 
     tokenizer, model, image_processor, _context_len = load_profile_model(
         args.model_path,
@@ -873,6 +1087,9 @@ def main():
         load_8bit=args.load_8bit,
         load_4bit=args.load_4bit,
         device=args.device,
+        method=args.method,
+        retain_tokens=args.retain_tokens,
+        selector_extra=selector_extra,
     )
     model.eval()
 

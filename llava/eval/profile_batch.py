@@ -126,6 +126,7 @@ def main():
     if args.conv_mode is None:
         args.conv_mode = infer_conv_mode(model_name)
     method = args.method
+    selector_extra = json.loads(args.selector_extra) if args.selector_extra else {}
 
     tokenizer, model, image_processor, _context_len = load_profile_model(
         args.model_path,
@@ -134,6 +135,9 @@ def main():
         load_8bit=args.load_8bit,
         load_4bit=args.load_4bit,
         device=args.device,
+        method=args.method,
+        retain_tokens=args.retain_tokens,
+        selector_extra=selector_extra,
     )
     model.eval()
 

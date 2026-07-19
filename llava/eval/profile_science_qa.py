@@ -28,6 +28,7 @@ from llava.eval.profile_inference import (
 )
 from llava.eval.profile_batch import run_profile_sample
 from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
+from llava.model.efficient_vlm import disable_efficient_llama
 from llava.utils import disable_torch_init
 
 
@@ -109,11 +110,20 @@ def parse_answer(pred_text: str, choices: List[str]) -> Tuple[str, int]:
     valid = OPTIONS[: len(choices)]
     if pred_text in valid:
         answer = pred_text
-    elif len(pred_text) >= 3 and pred_text[0] in valid and pred_text[1:3] == ". ":
+    elif pred_text and pred_text[0] in valid and re.match(r"^[A-Z](?:[\.\)]|\s|$)", pred_text):
         answer = pred_text[0]
     else:
-        matches = re.findall(r"The answer is ([A-Z])\.", pred_text)
-        answer = matches[0] if len(matches) == 1 else "FAILED"
+        patterns = [
+            r"^\(([A-Z])\)",
+            r"The answer is ([A-Z])\.",
+            r"answer is ([A-Z])",
+            r"option ([A-Z])",
+        ]
+        matches = []
+        for pattern in patterns:
+            matches.extend(re.findall(pattern, pred_text, flags=re.IGNORECASE))
+        normalized = [m.upper() for m in matches if m.upper() in valid]
+        answer = normalized[0] if len(set(normalized)) == 1 else "FAILED"
     return answer, OPTIONS.index(answer) if answer in valid else -1
 
 
@@ -183,6 +193,7 @@ def text_sample_args(args, sample: Dict[str, Any]):
 
 @torch.inference_mode()
 def profile_text_once(args, tokenizer_or_processor, model) -> ProfileResult:
+    disable_efficient_llama(model)
     tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
     model_device = getattr(model, "device", torch.device(args.device))
     conv = conv_templates[args.conv_mode].copy()
@@ -398,6 +409,7 @@ def main():
     )
     if args.conv_mode is None:
         args.conv_mode = infer_conv_mode(model_name)
+    selector_extra = json.loads(args.selector_extra) if args.selector_extra else {}
 
     tokenizer, model, image_processor, _context_len = load_profile_model(
         args.model_path,
@@ -406,6 +418,9 @@ def main():
         load_8bit=args.load_8bit,
         load_4bit=args.load_4bit,
         device=args.device,
+        method=args.method,
+        retain_tokens=args.retain_tokens,
+        selector_extra=selector_extra,
     )
     model.eval()
 
